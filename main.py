@@ -6,8 +6,34 @@ import time
 import threading
 from collections import deque
 from datetime import datetime
+from flask import Flask
+import os
 
 from config import BOT_TOKEN
+
+# Flask dummy server to keep Render alive
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Email Bomber Bot is alive and running on Render!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Flask keep-alive server starting on 0.0.0.0:{port} ...")
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=False,
+        use_reloader=False,
+        threaded=True
+    )
+    print(f"Flask keep-alive server bound to port {port}")
+
+# Start Flask FIRST in background
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+time.sleep(1)  # Give Flask 1 second to bind before polling starts
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -47,7 +73,6 @@ def generate_random_body():
 def send_via_guerrilla(to_email, subject, body):
     try:
         session = requests.Session()
-        # Get session token
         resp = session.get('https://api.guerrillamail.com/ajax.php?f=get_email_address')
         data = resp.json()
         sid = data.get('sid_token')
@@ -67,7 +92,8 @@ def send_via_guerrilla(to_email, subject, body):
         send_resp = session.post('https://api.guerrillamail.com/ajax.php', data=payload)
         result = send_resp.json()
         return result.get('status') == 'sent'
-    except Exception:
+    except Exception as e:
+        print(f"Send failed: {e}")
         return False
 
 def run_bomb_operation():
@@ -114,10 +140,6 @@ def run_bomb_operation():
 
     bot.send_message(chat_id, f"Welcome to the Email Bomber Bot\nOperation completed. Messages sent: {sent}/{op['count']}")
     current_operation = None
-    process_next_queue()
-
-def process_next_queue():
-    global current_operation
     if queue:
         next_req = queue.popleft()
         current_operation = next_req.copy()
@@ -125,8 +147,6 @@ def process_next_queue():
         current_operation['start_time'] = datetime.now()
         threading.Thread(target=run_bomb_operation).start()
         bot.send_message(next_req['chat_id'], f"Welcome to the Email Bomber Bot\nYour turn has started. Target: {next_req['target']} | Messages: {next_req['count']}")
-
-# Commands
 
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -247,12 +267,57 @@ def queue_cmd(message):
     for req in queue:
         if req['user_id'] == uid:
             found = True
-            eta = "unknown"  # simple ETA not calculated here for brevity
             bot.reply_to(message, f"Welcome to the Email Bomber Bot\nYour position: {pos} of {len(queue)}\nTarget: {req['target']}\nCount: {req['count']}")
             break
         pos += 1
     if not found:
         bot.reply_to(message, "Welcome to the Email Bomber Bot\nYou are not in the queue.")
+
+@bot.message_handler(commands=['cancel'])
+def cancel_cmd(message):
+    global queue
+    uid = message.from_user.id
+    old_len = len(queue)
+    queue = deque([req for req in queue if req['user_id'] != uid])
+    if len(queue) < old_len:
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nRemoved from queue.")
+    else:
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nYou were not in queue.")
+
+@bot.message_handler(commands=['status'])
+def status_cmd(message):
+    uid = message.from_user.id
+    text = "Welcome to the Email Bomber Bot\n"
+    if uid in user_data:
+        d = user_data[uid]
+        text += f"Target: {d.get('target', 'not set')}\nCount: {d.get('count', 'not set')}\nInterval: {d.get('interval', 3)} seconds\n"
+    else:
+        text += "No settings configured.\n"
+    if current_operation:
+        text += "Operation in progress.\n"
+    text += f"Queue length: {len(queue)}"
+    bot.reply_to(message, text)
+
+@bot.message_handler(commands=['stop'])
+def stop_cmd(message):
+    global current_operation
+    uid = message.from_user.id
+    if current_operation and current_operation['user_id'] == uid:
+        current_operation = None
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nCurrent operation stopped.")
+    else:
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nNo active operation to stop or not yours.")
+
+@bot.message_handler(commands=['reset'])
+def reset_cmd(message):
+    uid = message.from_user.id
+    if uid in user_data:
+        del user_data[uid]
+    bot.reply_to(message, "Welcome to the Email Bomber Bot\nAll settings cleared.")
+
+print("Email Bomber Bot starting on Render...")
+print("Flask keep-alive server thread started – waiting for bind confirmation...")
+bot.infinity_polling(skip_pending=True, none_stop=True)omber Bot\nYou are not in the queue.")
 
 @bot.message_handler(commands=['cancel'])
 def cancel_cmd(message):
