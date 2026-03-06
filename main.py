@@ -20,32 +20,25 @@ def home():
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
-    print(f"Flask keep-alive server starting on 0.0.0.0:{port} ...")
-    app.run(
-        host='0.0.0.0',
-        port=port,
-        debug=False,
-        use_reloader=False,
-        threaded=True
-    )
-    print(f"Flask keep-alive server bound to port {port}")
+    print(f"Flask keep-alive starting on 0.0.0.0:{port}")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
+    print(f"Flask bound to port {port}")
 
-# Start Flask FIRST in background
 flask_thread = threading.Thread(target=run_flask, daemon=True)
 flask_thread.start()
-time.sleep(1)  # Give Flask 1 second to bind before polling starts
+time.sleep(2)  # give time for Flask to bind
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Global state
 bomb_lock = threading.Lock()
-current_operation = None  # {'user_id': int, 'target': str, 'count': int, 'interval': int, 'sent': int, 'start_time': datetime, 'chat_id': int}
-queue = deque()           # deque of {'user_id': int, 'target': str, 'count': int, 'interval': int, 'chat_id': int}
-user_data = {}            # {user_id: {'target': str, 'count': int, 'interval': int}}
+current_operation = None
+queue = deque()
+user_data = {}
 
 GUERRILLA_DOMAINS = [
     'sharklasers.com', 'grr.la', 'guerrillamail.com', 'guerrillamail.de',
-    'guerrillamail.net', 'guerrillamail.org', 'guerrillamail.biz', 'spamthisplease.com'
+    'guerrillamail.net', 'guerrillamail.org', 'guerrillamail.biz'
 ]
 
 def get_new_temp_email():
@@ -54,7 +47,7 @@ def get_new_temp_email():
     return f"{username}@{domain}"
 
 def generate_random_subject():
-    prefixes = ['Signal', 'Drop', 'Echo', 'Void', 'Pulse', 'Noise', 'Transmission', 'Packet']
+    prefixes = ['Signal', 'Drop', 'Echo', 'Void', 'Pulse', 'Noise']
     return f"{random.choice(prefixes)} #{random.randint(1000, 9999)}"
 
 def generate_random_body():
@@ -63,11 +56,9 @@ def generate_random_body():
         "Pointless data packet delivered to inbox.",
         "Clutter level increased by one unit.",
         "Null message arrived for no reason.",
-        "Entropy injection complete.",
-        "Unidentified bytes landed in inbox.",
-        "Spam signature detected and ignored."
+        "Entropy injection complete."
     ]
-    filler = ''.join(random.choices(string.ascii_letters + string.digits + ' .,!?@#$%^&*', k=random.randint(35, 90)))
+    filler = ''.join(random.choices(string.ascii_letters + string.digits + ' .,!?', k=random.randint(30, 80)))
     return random.choice(templates) + " " + filler
 
 def send_via_guerrilla(to_email, subject, body):
@@ -93,7 +84,7 @@ def send_via_guerrilla(to_email, subject, body):
         result = send_resp.json()
         return result.get('status') == 'sent'
     except Exception as e:
-        print(f"Send failed: {e}")
+        print(f"Send error: {e}")
         return False
 
 def run_bomb_operation():
@@ -257,6 +248,67 @@ def confirm_bomb_handler(message, uid, chat_id, target, count, interval):
             threading.Thread(target=run_bomb_operation).start()
 
 @bot.message_handler(commands=['queue'])
+def queue_cmd(message):
+    if not queue:
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nQueue is empty.")
+        return
+    uid = message.from_user.id
+    pos = 1
+    found = False
+    for req in queue:
+        if req['user_id'] == uid:
+            found = True
+            bot.reply_to(message, f"Welcome to the Email Bomber Bot\nYour position: {pos} of {len(queue)}\nTarget: {req['target']}\nCount: {req['count']}")
+            break
+        pos += 1
+    if not found:
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nYou are not in the queue.")
+
+@bot.message_handler(commands=['cancel'])
+def cancel_cmd(message):
+    global queue
+    uid = message.from_user.id
+    old_len = len(queue)
+    queue = deque([req for req in queue if req['user_id'] != uid])
+    if len(queue) < old_len:
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nRemoved from queue.")
+    else:
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nYou were not in queue.")
+
+@bot.message_handler(commands=['status'])
+def status_cmd(message):
+    uid = message.from_user.id
+    text = "Welcome to the Email Bomber Bot\n"
+    if uid in user_data:
+        d = user_data[uid]
+        text += f"Target: {d.get('target', 'not set')}\nCount: {d.get('count', 'not set')}\nInterval: {d.get('interval', 3)} seconds\n"
+    else:
+        text += "No settings configured.\n"
+    if current_operation:
+        text += "Operation in progress.\n"
+    text += f"Queue length: {len(queue)}"
+    bot.reply_to(message, text)
+
+@bot.message_handler(commands=['stop'])
+def stop_cmd(message):
+    global current_operation
+    uid = message.from_user.id
+    if current_operation and current_operation['user_id'] == uid:
+        current_operation = None
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nCurrent operation stopped.")
+    else:
+        bot.reply_to(message, "Welcome to the Email Bomber Bot\nNo active operation to stop or not yours.")
+
+@bot.message_handler(commands=['reset'])
+def reset_cmd(message):
+    uid = message.from_user.id
+    if uid in user_data:
+        del user_data[uid]
+    bot.reply_to(message, "Welcome to the Email Bomber Bot\nAll settings cleared.")
+
+print("Email Bomber Bot starting on Render...")
+print("Flask keep-alive thread started – waiting for bind...")
+bot.infinity_polling(skip_pending=True, none_stop=True))
 def queue_cmd(message):
     if not queue:
         bot.reply_to(message, "Welcome to the Email Bomber Bot\nQueue is empty.")
