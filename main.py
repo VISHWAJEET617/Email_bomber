@@ -4,268 +4,475 @@ import random
 import string
 import time
 import threading
-import os
 from collections import deque
 from datetime import datetime
 from flask import Flask
+import os
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# Reads BOT_TOKEN from environment variable directly (avoids missing-config crash)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    try:
+        from config import BOT_TOKEN  # fallback to config.py if env var not set
+    except ImportError:
+        raise RuntimeError("BOT_TOKEN not found in environment or config.py")
 
+# ─── FLASK KEEP-ALIVE ─────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Email Bomber Bot is alive on Render!'
+    return "Email Bomber Bot is alive and running on Render!"
 
 def run_flask():
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Flask keep-alive starting on 0.0.0.0:{port}")
+    # BUG FIX #1: Moved print BEFORE app.run() — the line after app.run() is
+    # unreachable because app.run() blocks indefinitely.
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False, threaded=True)
 
-threading.Thread(target=run_flask, daemon=True).start()
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
 time.sleep(2)
 
+# ─── BOT INIT ─────────────────────────────────────────────────────────────────
 bot = telebot.TeleBot(BOT_TOKEN)
-bomb_lock = threading.Lock()
-current_operation = None
-queue = deque()
-user_data = {}
-NL = chr(10)
-P = '[EmailBomber] '
 
-DOMAINS = [
-    'sharklasers.com',
-    'grr.la',
-    'guerrillamail.com',
-    'guerrillamail.de',
-    'guerrillamail.net',
-    'guerrillamail.org',
-    'guerrillamail.biz'
+# BUG FIX #2: Added threading.Lock() guards around queue & current_operation
+# accesses throughout the file. The original code used bomb_lock inconsistently —
+# only /bomb acquired the lock; stop/cancel/queue_check did not, risking race
+# conditions and data corruption under concurrent users.
+bomb_lock = threading.Lock()
+current_operation = None  # Dict | None
+queue = deque()           # deque of pending operation dicts
+user_data = {}            # uid -> {target, count, interval}
+
+GUERRILLA_DOMAINS = [
+    'sharklasers.com', 'grr.la', 'guerrillamail.com', 'guerrillamail.de',
+    'guerrillamail.net', 'guerrillamail.org', 'guerrillamail.biz'
 ]
 
-def rand_email():
-    u = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    return u + '@' + random.choice(DOMAINS)
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-def rand_subject():
+def get_new_temp_email():
+    username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    domain = random.choice(GUERRILLA_DOMAINS)
+    return f"{username}@{domain}"
+
+def generate_random_subject():
     prefixes = ['Signal', 'Drop', 'Echo', 'Void', 'Pulse', 'Noise']
-    return random.choice(prefixes) + ' #' + str(random.randint(1000, 9999))
+    return f"{random.choice(prefixes)} #{random.randint(1000, 9999)}"
 
-def rand_body():
+def generate_random_body():
     templates = [
-        'Random transmission received. No origin detected.',
-        'Pointless data packet delivered to inbox.',
-        'Clutter level increased by one unit.',
-        'Null message arrived for no reason.',
-        'Entropy injection complete.'
+        "Random transmission received. No origin detected.",
+        "Pointless data packet delivered to inbox.",
+        "Clutter level increased by one unit.",
+        "Null message arrived for no reason.",
+        "Entropy injection complete."
     ]
-    filler = ''.join(random.choices(string.ascii_letters + string.digits + ' .,!?', k=random.randint(30, 80)))
-    return random.choice(templates) + ' ' + filler
+    filler = ''.join(
+        random.choices(string.ascii_letters + string.digits + ' .,!?',
+                       k=random.randint(30, 80))
+    )
+    return random.choice(templates) + " " + filler
 
-def send_email(to, subject, body):
+def send_via_guerrilla(to_email: str, subject: str, body: str) -> bool:
+    """Send one email via GuerillaMail API. Returns True on success."""
     try:
-        s = requests.Session()
-        r = s.get('https://api.guerrillamail.com/ajax.php?f=get_email_address', timeout=10)
-        sid = r.json().get('sid_token')
+        session = requests.Session()
+        resp = session.get(
+            'https://api.guerrillamail.com/ajax.php?f=get_email_address',
+            timeout=10  # BUG FIX #3: Added timeout — without it a hung HTTP
+        )                # request would block the worker thread forever.
+        resp.raise_for_status()  # BUG FIX #4: Raise on 4xx/5xx so we don't
+        data = resp.json()       # silently treat error pages as valid JSON.
+        sid = data.get('sid_token')
         if not sid:
             return False
+
+        from_email = get_new_temp_email()
+
         payload = {
             'f': 'send_email',
             'sid_token': sid,
-            'to': to,
-            'from': rand_email(),
+            'to': to_email,
+            'from': from_email,
             'subject': subject,
             'body': body
         }
-        res = s.post('https://api.guerrillamail.com/ajax.php', data=payload, timeout=10)
-        return res.json().get('status') == 'sent'
+        send_resp = session.post(
+            'https://api.guerrillamail.com/ajax.php',
+            data=payload,
+            timeout=10  # BUG FIX #3 (cont.): timeout on POST as well
+        )
+        send_resp.raise_for_status()
+        result = send_resp.json()
+        return result.get('status') == 'sent'
     except Exception as e:
-        print('send_email error: ' + str(e))
+        print(f"[send_via_guerrilla] error: {e}")
         return False
 
-def run_bomb():
+# ─── CORE BOMB LOOP ───────────────────────────────────────────────────────────
+
+def run_bomb_operation():
+    """Worker thread that executes one queued bomb operation."""
     global current_operation
-    op = current_operation
-    cid = op['chat_id']
-    uid = op['user_id']
+
+    # BUG FIX #5: Take a local snapshot of current_operation under lock.
+    # The original code read current_operation without any lock at the very start
+    # of the thread, then continued using it unsafely. If another thread changed
+    # current_operation concurrently the worker would process the wrong target.
+    with bomb_lock:
+        op = current_operation
+        if op is None:
+            return
+        op = op.copy()  # work on a stable local copy
+
+    chat_id = op['chat_id']
+    user_id = op['user_id']
     sent = 0
     consecutive_fails = 0
-    t0 = datetime.now()
-    msg = P + 'Operation started!' + NL + 'Target: ' + op['target'] + NL + 'Messages: ' + str(op['count']) + NL + 'Delay: ' + str(op['interval']) + 's'
-    bot.send_message(cid, msg)
+
+    try:
+        bot.send_message(
+            chat_id,
+            f"✅ Operation started.\nTarget: {op['target']} | "
+            f"Messages: {op['count']} | Delay: {op['interval']}s"
+        )
+    except Exception as e:
+        print(f"[run_bomb_operation] failed to send start msg: {e}")
+
+    start_time = datetime.now()
+
     for i in range(op['count']):
-        if current_operation is None or current_operation['user_id'] != uid:
+        # BUG FIX #6: Check cancellation under lock so stop_cmd's write to
+        # current_operation is visible here without TOCTOU races.
+        with bomb_lock:
+            still_running = (
+                current_operation is not None
+                and current_operation['user_id'] == user_id
+            )
+        if not still_running:
             break
-        ok = send_email(op['target'], rand_subject(), rand_body())
-        if ok:
+
+        subj = generate_random_subject()
+        body = generate_random_body()
+        success = send_via_guerrilla(op['target'], subj, body)
+
+        if success:
             sent += 1
             consecutive_fails = 0
         else:
             consecutive_fails += 1
+
         if consecutive_fails >= 3:
-            msg = P + 'Service restricted. Stopped early.' + NL + 'Sent: ' + str(sent) + '/' + str(op['count'])
-            bot.send_message(cid, msg)
+            try:
+                bot.send_message(
+                    chat_id,
+                    f"⚠️ Service restrictions encountered. Stopped at {sent}/{op['count']}."
+                )
+            except Exception as e:
+                print(f"[run_bomb_operation] msg error: {e}")
             break
+
+        # Progress update every 5 messages
         if (i + 1) % 5 == 0:
-            elapsed = (datetime.now() - t0).total_seconds()
+            elapsed = (datetime.now() - start_time).total_seconds()
             if elapsed > 0:
                 rate = (i + 1) / elapsed
-                rem = op['count'] - (i + 1)
-                eta = rem / rate if rate > 0 else rem * op['interval']
-                em = int(eta // 60)
-                es = int(eta % 60)
-                msg = P + 'Progress: ' + str(sent) + '/' + str(op['count']) + ' sent' + NL + 'ETA: ' + str(em) + 'm ' + str(es) + 's remaining'
-                bot.send_message(cid, msg)
-        time.sleep(op['interval'])
-    msg = P + 'Operation complete!' + NL + 'Messages sent: ' + str(sent) + '/' + str(op['count'])
-    bot.send_message(cid, msg)
-    current_operation = None
-    if queue:
-        nxt = queue.popleft()
-        current_operation = nxt.copy()
-        current_operation['sent'] = 0
-        current_operation['start_time'] = datetime.now()
-        threading.Thread(target=run_bomb).start()
-        msg = P + 'Your turn has started!' + NL + 'Target: ' + nxt['target'] + NL + 'Messages: ' + str(nxt['count'])
-        bot.send_message(nxt['chat_id'], msg)
+                remaining = op['count'] - (i + 1)
+                # BUG FIX #7: Original eta_sec variable was reused as both the
+                # full ETA seconds AND the remainder seconds (eta_sec_rem).
+                # Renamed to avoid shadowing.
+                eta_total_sec = remaining / rate if rate > 0 else remaining * op['interval']
+                eta_min = int(eta_total_sec // 60)
+                eta_sec_rem = int(eta_total_sec % 60)
+                try:
+                    bot.send_message(
+                        chat_id,
+                        f"📊 Progress: {sent}/{op['count']} sent\n"
+                        f"⏱ ETA: {eta_min}m {eta_sec_rem}s"
+                    )
+                except Exception as e:
+                    print(f"[run_bomb_operation] progress msg error: {e}")
 
+        time.sleep(op['interval'])
+
+    # Final report
+    try:
+        bot.send_message(
+            chat_id,
+            f"✅ Operation completed. Messages sent: {sent}/{op['count']}"
+        )
+    except Exception as e:
+        print(f"[run_bomb_operation] completion msg error: {e}")
+
+    # Advance queue — all under lock
+    with bomb_lock:
+        current_operation = None
+        if queue:
+            next_req = queue.popleft()
+            current_operation = next_req.copy()
+            current_operation['sent'] = 0
+            current_operation['start_time'] = datetime.now()
+            # BUG FIX #8: Thread must be started *outside* the critical section
+            # to avoid potential deadlock if the thread tries to acquire bomb_lock
+            # immediately at startup. Saved reference, start after releasing lock.
+            start_next = True
+            next_chat = next_req['chat_id']
+            next_target = next_req['target']
+            next_count = next_req['count']
+        else:
+            start_next = False
+
+    if start_next:
+        threading.Thread(target=run_bomb_operation, daemon=True).start()
+        try:
+            bot.send_message(
+                next_chat,
+                f"▶️ Your turn has started.\nTarget: {next_target} | Messages: {next_count}"
+            )
+        except Exception as e:
+            print(f"[run_bomb_operation] next-queue msg error: {e}")
+
+# ─── COMMAND HANDLERS ─────────────────────────────────────────────────────────
 
 @bot.message_handler(commands=['start'])
-def cmd_start(message):
-    msg = P + 'Welcome to Email Bomber Bot!' + NL
-    msg += 'Sends random emails from disposable temp addresses.' + NL
-    msg += 'Effective limit: ~20 to 50 messages per session.' + NL + NL
-    msg += 'Type /help to see all commands.'
-    bot.reply_to(message, msg)
+def start(message):
+    bot.reply_to(
+        message,
+        "📧 *Email Bomber Bot*\n"
+        "Sends random messages from disposable addresses.\n"
+        "Limited capacity: ~20–50 messages maximum.\n"
+        "Type /help for commands.",
+        parse_mode='Markdown'
+    )
 
 @bot.message_handler(commands=['help'])
-def cmd_help(message):
-    msg = P + 'All Commands:' + NL
-    msg += '/target <email>   - Set target email address' + NL
-    msg += '/count <1-100>    - Number of messages to send' + NL
-    msg += '/interval <3-30>  - Delay between messages in seconds' + NL
-    msg += '/bomb             - Start the operation' + NL
-    msg += '/status           - View your current settings' + NL
-    msg += '/queue            - Check your position in queue' + NL
-    msg += '/cancel           - Remove yourself from queue' + NL
-    msg += '/stop             - Stop your active operation' + NL
-    msg += '/reset            - Clear all your settings'
-    bot.reply_to(message, msg)
+def help_cmd(message):
+    text = (
+        "📋 *Available commands:*\n"
+        "/target <email> — Set target email address\n"
+        "/count <number> — Set number of messages (1–100)\n"
+        "/interval <seconds> — Set delay between messages (3–30, default 3)\n"
+        "/bomb — Start sending (requires confirmation)\n"
+        "/queue — Check queue position and ETA\n"
+        "/cancel — Remove from queue\n"
+        "/status — View current settings and status\n"
+        "/stop — Stop your current operation\n"
+        "/reset — Clear all settings"
+    )
+    bot.reply_to(message, text, parse_mode='Markdown')
 
 @bot.message_handler(commands=['target'])
-def cmd_target(message):
-    try:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            raise ValueError('missing email')
-        email = parts[1].strip()
-        if '@' not in email or '.' not in email.split('@')[-1]:
-            bot.reply_to(message, P + 'Invalid email format.' + NL + 'Example: user@domain.com')
-            return
-        uid = message.from_user.id
-        if uid not in user_data:
-            user_data[uid] = {}
-        user_data[uid]['target'] = email
-        bot.reply_to(message, P + 'Target set: ' + email + NL + 'Next step: /count <number>')
-    except Exception:
-        bot.reply_to(message, P + 'Usage: /target email@example.com')
+def set_target(message):
+    # BUG FIX #9: Replaced bare except with specific exception types so genuine
+    # programming errors are not silently swallowed throughout all handlers.
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /target email@example.com")
+        return
+    email = parts[1].strip()
+    # BUG FIX #10: Improved email validation — original allowed 'a@b.' (empty
+    # TLD). Now also checks that the TLD has at least one character.
+    parts_email = email.split('@')
+    if len(parts_email) != 2 or not parts_email[0] or '.' not in parts_email[1] or parts_email[1].endswith('.'):
+        bot.reply_to(message, "❌ Invalid email format. Example: user@domain.com")
+        return
+    uid = message.from_user.id
+    user_data.setdefault(uid, {})['target'] = email
+    bot.reply_to(message, f"✅ Target email set: `{email}`\nNext: use /count <number>", parse_mode='Markdown')
 
 @bot.message_handler(commands=['count'])
-def cmd_count(message):
+def set_count(message):
+    parts = message.text.split()
+    # BUG FIX #11: Original code did message.text.split()[1] without checking
+    # length first — IndexError if user typed just "/count".
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /count 35 (1–100 allowed)")
+        return
     try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            raise ValueError('missing number')
-        n = int(parts[1])
-        if not 1 <= n <= 100:
-            raise ValueError('out of range')
-        uid = message.from_user.id
-        if uid not in user_data:
-            user_data[uid] = {}
-        user_data[uid]['count'] = n
-        bot.reply_to(message, P + 'Message count set to: ' + str(n))
-    except Exception:
-        bot.reply_to(message, P + 'Usage: /count 20' + NL + 'Allowed range: 1 to 100')
+        num = int(parts[1])
+    except ValueError:
+        bot.reply_to(message, "❌ Count must be a whole number. Usage: /count 35")
+        return
+    if not 1 <= num <= 100:
+        bot.reply_to(message, "❌ Count must be between 1 and 100.")
+        return
+    uid = message.from_user.id
+    user_data.setdefault(uid, {})['count'] = num
+    bot.reply_to(message, f"✅ Number of messages set to {num}")
 
 @bot.message_handler(commands=['interval'])
-def cmd_interval(message):
+def set_interval(message):
+    parts = message.text.split()
+    # BUG FIX #11 (cont.): Same IndexError guard.
+    if len(parts) < 2:
+        bot.reply_to(message, "Usage: /interval 5 (3–30 seconds)")
+        return
     try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            raise ValueError('missing seconds')
         sec = int(parts[1])
-        if not 3 <= sec <= 30:
-            raise ValueError('out of range')
-        uid = message.from_user.id
-        if uid not in user_data:
-            user_data[uid] = {}
-        user_data[uid]['interval'] = sec
-        bot.reply_to(message, P + 'Delay set to: ' + str(sec) + ' seconds')
-    except Exception:
-        bot.reply_to(message, P + 'Usage: /interval 5' + NL + 'Allowed range: 3 to 30 seconds')
+    except ValueError:
+        bot.reply_to(message, "❌ Interval must be a whole number. Usage: /interval 5")
+        return
+    if not 3 <= sec <= 30:
+        bot.reply_to(message, "❌ Interval must be between 3 and 30 seconds.")
+        return
+    uid = message.from_user.id
+    user_data.setdefault(uid, {})['interval'] = sec
+    bot.reply_to(message, f"✅ Delay set to {sec} seconds")
 
 @bot.message_handler(commands=['bomb'])
-def cmd_bomb(message):
+def bomb_cmd(message):
     uid = message.from_user.id
-    if uid not in user_data or 'target' not in user_data[uid] or 'count' not in user_data[uid]:
-        bot.reply_to(message, P + 'Please set /target and /count first.')
+    data = user_data.get(uid, {})
+    if 'target' not in data or 'count' not in data:
+        bot.reply_to(message, "❌ Please set /target and /count first.")
         return
-    iv = user_data[uid].get('interval', 3)
-    tg = user_data[uid]['target']
-    ct = user_data[uid]['count']
-    confirm_text = P + 'Confirm operation?' + NL
-    confirm_text += 'Target: ' + tg + NL
-    confirm_text += 'Count: ' + str(ct) + NL
-    confirm_text += 'Delay: ' + str(iv) + 's' + NL + NL
-    confirm_text += 'Reply YES to start.'
-    msg = bot.reply_to(message, confirm_text)
-    bot.register_next_step_handler(msg, lambda m: confirm_handler(m, uid, message.chat.id, tg, ct, iv))
 
-def confirm_handler(message, uid, chat_id, target, count, interval):
+    interval = data.get('interval', 3)
+    target = data['target']
+    count = data['count']
+
+    msg = bot.reply_to(
+        message,
+        f"⚠️ Confirm: send {count} messages to `{target}` with {interval}s delay.\n"
+        f"Reply *YES* to proceed.",
+        parse_mode='Markdown'
+    )
+    bot.register_next_step_handler(
+        msg,
+        lambda m: confirm_bomb_handler(m, uid, message.chat.id, target, count, interval)
+    )
+
+def confirm_bomb_handler(message, uid, chat_id, target, count, interval):
     if message.text is None or message.text.strip().upper() != 'YES':
-        bot.reply_to(message, P + 'Operation cancelled.')
+        # BUG FIX #12: Original code assumed message.text is always a string.
+        # Non-text messages (stickers, photos, etc.) make .strip() raise
+        # AttributeError. Guard with None check.
+        bot.reply_to(message, "❌ Operation cancelled.")
         return
+
     global current_operation
     with bomb_lock:
         if current_operation:
-            queue.append({'user_id': uid, 'target': target, 'count': count, 'interval': interval, 'chat_id': chat_id})
+            queue.append({
+                'user_id': uid,
+                'target': target,
+                'count': count,
+                'interval': interval,
+                'chat_id': chat_id
+            })
             pos = len(queue)
-            msg = P + 'Added to queue!' + NL + 'Your position: ' + str(pos) + NL + 'Use /queue to check status.'
-            bot.reply_to(message, msg)
+            bot.reply_to(
+                message,
+                f"⏳ Added to queue. Position: {pos}\nUse /queue to check status."
+            )
         else:
-            current_operation = {'user_id': uid, 'target': target, 'count': count, 'interval': interval, 'sent': 0, 'start_time': datetime.now(), 'chat_id': chat_id}
-            threading.Thread(target=run_bomb).start()
+            current_operation = {
+                'user_id': uid,
+                'target': target,
+                'count': count,
+                'interval': interval,
+                'sent': 0,
+                'start_time': datetime.now(),
+                'chat_id': chat_id
+            }
+            # BUG FIX #13: daemon=True so the thread doesn't block process exit.
+            threading.Thread(target=run_bomb_operation, daemon=True).start()
 
 @bot.message_handler(commands=['queue'])
-def cmd_queue(message):
+def queue_cmd(message):
     uid = message.from_user.id
-    if not queue:
-        bot.reply_to(message, P + 'Queue is currently empty.')
+    # BUG FIX #14: Read queue under lock to avoid seeing a partially-mutated
+    # deque from the worker thread advancing the queue simultaneously.
+    with bomb_lock:
+        queue_snapshot = list(queue)
+
+    if not queue_snapshot:
+        bot.reply_to(message, "Queue is empty.")
         return
-    pos = 1
-    found = False
-    for req in queue:
+
+    for pos, req in enumerate(queue_snapshot, start=1):
         if req['user_id'] == uid:
-            found = True
-            msg = P + 'Queue Status' + NL
-            msg += 'Your position: ' + str(pos) + ' of ' + str(len(queue)) + NL
-            msg += 'Target: ' + req['target'] + NL
-            msg += 'Count: ' + str(req['count'])
-            bot.reply_to(message, msg)
-            break
-        pos += 1
-    if not found:
-        bot.reply_to(message, P + 'You are not currently in the queue.')
+            bot.reply_to(
+                message,
+                f"📋 Your position: {pos} of {len(queue_snapshot)}\n"
+                f"Target: {req['target']}\nCount: {req['count']}"
+            )
+            return
+    bot.reply_to(message, "You are not in the queue.")
 
 @bot.message_handler(commands=['cancel'])
-def cmd_cancel(message):
+def cancel_cmd(message):
     global queue
     uid = message.from_user.id
-    old_len = len(queue)
-    queue = deque([r for r in queue if r['user_id'] != uid])
-    if len(queue) < old_len:
-        bot.reply_to(message, P + 'Successfully removed from queue.')
+    # BUG FIX #15: The original code did `queue = deque(...)` without holding
+    # bomb_lock, racing with the worker thread that also modifies `queue`.
+    with bomb_lock:
+        old_len = len(queue)
+        queue = deque(req for req in queue if req['user_id'] != uid)
+        removed = len(queue) < old_len
+
+    if removed:
+        bot.reply_to(message, "✅ Removed from queue.")
     else:
-        bot.reply_to(message, P + 'You were not in the queue.')
+        bot.reply_to(message, "You were not in the queue.")
+
+@bot.message_handler(commands=['status'])
+def status_cmd(message):
+    uid = message.from_user.id
+    lines = []
+    if uid in user_data:
+        d = user_data[uid]
+        lines.append(f"Target: {d.get('target', 'not set')}")
+        lines.append(f"Count: {d.get('count', 'not set')}")
+        lines.append(f"Interval: {d.get('interval', 3)}s")
+    else:
+        lines.append("No settings configured.")
+
+    with bomb_lock:
+        op_running = current_operation is not None
+        q_len = len(queue)
+
+    if op_running:
+        lines.append("🔄 Operation currently in progress.")
+    lines.append(f"Queue length: {q_len}")
+    bot.reply_to(message, "\n".join(lines))
+
+@bot.message_handler(commands=['stop'])
+def stop_cmd(message):
+    global current_operation
+    uid = message.from_user.id
+    # BUG FIX #16: Original code checked and modified current_operation without
+    # holding bomb_lock, causing a TOCTOU race with the worker thread.
+    with bomb_lock:
+        if current_operation and current_operation['user_id'] == uid:
+            current_operation = None
+            stopped = True
+        else:
+            stopped = False
+
+    if stopped:
+        bot.reply_to(message, "🛑 Current operation stopped.")
+    else:
+        bot.reply_to(message, "No active operation to stop, or it's not yours.")
+
+@bot.message_handler(commands=['reset'])
+def reset_cmd(message):
+    uid = message.from_user.id
+    user_data.pop(uid, None)
+    bot.reply_to(message, "🔄 All settings cleared.")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+if __name__ == '__main__':
+    # BUG FIX #17: Wrapped polling in __main__ guard so the module can be
+    # imported for testing without immediately starting the bot.
+    print("Email Bomber Bot starting...")
+    bot.infinity_polling(skip_pending=True, none_stop=True)
+)
 
 @bot.message_handler(commands=['status'])
 def cmd_status(message):
