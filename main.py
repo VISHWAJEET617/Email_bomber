@@ -308,7 +308,7 @@ def reset_cmd(message):
 
 print("Email Bomber Bot starting on Render...")
 print("Flask keep-alive thread started – waiting for bind...")
-bot.infinity_polling(skip_pending=True, none_stop=True))
+bot.infinity_polling(skip_pending=True, none_stop=True)
 def queue_cmd(message):
     if not queue:
         bot.reply_to(message, "Welcome to the Email Bomber Bot\nQueue is empty.")
